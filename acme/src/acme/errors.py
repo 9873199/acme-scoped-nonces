@@ -38,14 +38,19 @@ class NonceError(ClientError):
 
 
 class BadNonce(NonceError):
-    """Bad nonce error."""
+    """Bad nonce error.
+
+    The nonce is retained for programmatic use, but is deliberately omitted
+    from the string representation so it cannot leak through logs or generic
+    exception reporting.
+    """
     def __init__(self, nonce: str, error: Exception, *args: Any) -> None:
         super().__init__(*args)
         self.nonce = nonce
         self.error = error
 
     def __str__(self) -> str:
-        return 'Invalid nonce ({0!r}): {1}'.format(self.nonce, self.error)
+        return 'Invalid replay nonce: {0}'.format(self.error)
 
 
 class MissingNonce(NonceError):
@@ -63,9 +68,9 @@ class MissingNonce(NonceError):
         self.response = response
 
     def __str__(self) -> str:
+        method = getattr(getattr(self.response, 'request', None), 'method', 'ACME')
         return ('Server {0} response did not include a replay '
-                'nonce, headers: {1} (This may be a service outage)'.format(
-                    self.response.request.method, self.response.headers))
+                'nonce (This may be a service outage)'.format(method))
 
 
 class PollError(ClientError):

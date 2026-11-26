@@ -1,17 +1,25 @@
 """ACME client API."""
+import asyncio
 import base64
+from collections import deque
+from concurrent.futures import CancelledError as FutureCancelledError
 import datetime
 from email.utils import parsedate_tz
 import http.client as http_client
 import logging
 import math
 import random
+import re
+import threading
 import time
 from typing import Any
+from typing import Callable
 from typing import cast
 from typing import Mapping
 from typing import Optional
 from typing import Union
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 from cryptography import x509
 
@@ -29,6 +37,217 @@ from acme import messages
 logger = logging.getLogger(__name__)
 
 DEFAULT_NETWORK_TIMEOUT = 45
+DEFAULT_NONCE_POOL_SIZE = 32
+DEFAULT_NONCE_MAX_AGE = 5 * 60
+DEFAULT_BAD_NONCE_RETRIES = 1
+
+_NONCE_RE = re.compile(r'^[A-Za-z0-9_-]+={0,2}$')
+_CANCELLATION_ERRORS = (asyncio.CancelledError, FutureCancelledError, GeneratorExit)
+_UNSET = object()
+
+
+def _canonical_url(url: str) -> str:
+    """Return a stable URL representation for nonce scope keys."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path or '/'
+    return urlunsplit((scheme, netloc, path, parts.query, ''))
+
+
+def _decode_nonce(value: Union[str, bytes]) -> bytes:
+    """Decode an RFC 8555 Replay-Nonce using JOSE base64url rules."""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode('ascii')
+        except UnicodeDecodeError as error:
+            raise jose.DeserializationError('Nonce is not ASCII') from error
+    if not isinstance(value, str) or not _NONCE_RE.fullmatch(value):
+        raise jose.DeserializationError('Nonce is not valid JOSE base64url')
+    try:
+        return jws.Header._fields['nonce'].decode(value)
+    except jose.DeserializationError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise jose.DeserializationError('Nonce is not valid JOSE base64url') from error
+
+
+class _NonceFetch:
+    """One single-flight nonce fetch shared by concurrent pool waiters."""
+    __slots__ = ('done', 'cancelled', 'error')
+
+    def __init__(self) -> None:
+        self.done = False
+        self.cancelled = False
+        self.error: Optional[BaseException] = None
+
+
+class _NoncePool:
+    """State for one directory/account nonce scope."""
+    __slots__ = ('available', 'seen', 'pending')
+
+    def __init__(self) -> None:
+        self.available: deque[tuple[float, bytes]] = deque()
+        self.seen: dict[bytes, float] = {}
+        self.pending: Optional[_NonceFetch] = None
+
+
+class NonceManager:
+    """Thread-safe ACME nonce pool with directory and account isolation.
+
+    A nonce is scoped to the exact newNonce URL that supplied it. By default,
+    nonces are also scoped to the account identity, so a manager may safely be
+    shared by clients for different CAs and by clients using different accounts
+    on the same CA. Set ``allow_cross_account=True`` to explicitly share nonces
+    between accounts using the same directory; this policy is applied uniformly
+    to every directory.
+
+    Each scope has a bounded number of nonces and every nonce expires after
+    ``max_age`` seconds. Claiming a nonce removes it atomically, so a single
+    available value cannot be handed to two concurrent requests.
+    """
+
+    def __init__(self, max_size: int = DEFAULT_NONCE_POOL_SIZE,
+                 max_age: float = DEFAULT_NONCE_MAX_AGE, *,
+                 allow_cross_account: bool = False,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        if max_size < 1:
+            raise ValueError('max_size must be positive')
+        if max_age <= 0:
+            raise ValueError('max_age must be positive')
+        self.max_size = max_size
+        self.max_age = max_age
+        self.allow_cross_account = allow_cross_account
+        self._clock = clock
+        self._condition = threading.Condition()
+        self._pools: dict[tuple[str, Optional[str]], _NoncePool] = {}
+
+    def scope_for(self, directory_url: str,
+                  account_id: Optional[str] = None) -> tuple[str, Optional[str]]:
+        """Build the nonce scope for a directory and account."""
+        account_scope = None if self.allow_cross_account else account_id
+        return (_canonical_url(directory_url), account_scope)
+
+    def _pool_locked(self, scope: tuple[str, Optional[str]]) -> _NoncePool:
+        pool = self._pools.get(scope)
+        if pool is None:
+            pool = _NoncePool()
+            self._pools[scope] = pool
+        return pool
+
+    def _prune_locked(self, pool: _NoncePool, now: float) -> None:
+        while pool.available and pool.available[0][0] <= now:
+            pool.available.popleft()
+        for nonce, expires in list(pool.seen.items()):
+            if expires <= now:
+                del pool.seen[nonce]
+
+    def _claim_locked(self, pool: _NoncePool) -> Optional[bytes]:
+        now = self._clock()
+        self._prune_locked(pool, now)
+        if not pool.available:
+            return None
+        _, nonce = pool.available.popleft()
+        return nonce
+
+    def _add_locked(self, pool: _NoncePool, nonce: bytes) -> bool:
+        now = self._clock()
+        self._prune_locked(pool, now)
+        if nonce in pool.seen:
+            return False
+        while len(pool.available) >= self.max_size:
+            pool.available.popleft()
+        expires = now + self.max_age
+        pool.available.append((expires, nonce))
+        pool.seen[nonce] = expires
+        return True
+
+    def add_nonce(self, scope: tuple[str, Optional[str]],
+                  nonce: Union[str, bytes]) -> bool:
+        """Add a nonce to a scope, rejecting duplicate values."""
+        decoded = _decode_nonce(nonce)
+        with self._condition:
+            return self._add_locked(self._pool_locked(scope), decoded)
+
+    def mark_used(self, scope: tuple[str, Optional[str]],
+                  nonce: Union[str, bytes]) -> None:
+        """Remember a consumed nonce so a duplicate response cannot revive it."""
+        decoded = _decode_nonce(nonce)
+        with self._condition:
+            pool = self._pool_locked(scope)
+            now = self._clock()
+            self._prune_locked(pool, now)
+            pool.available = deque(
+                entry for entry in pool.available if entry[1] != decoded)
+            pool.seen.setdefault(decoded, now + self.max_age)
+
+    def claim_nonce(self, scope: tuple[str, Optional[str]]) -> Optional[bytes]:
+        """Atomically claim one available nonce from a scope."""
+        with self._condition:
+            return self._claim_locked(self._pool_locked(scope))
+
+    def get_nonce(self, scope: tuple[str, Optional[str]],
+                  fetch: Callable[[], Union[str, bytes]]) -> bytes:
+        """Claim a nonce, coalescing concurrent fetches when the pool is empty.
+
+        If the thread performing a fetch is cancelled, another waiter takes
+        over instead of inheriting that cancellation. Other fetch failures are
+        propagated to all current waiters.
+        """
+        duplicate_fetches = 0
+        while True:
+            with self._condition:
+                pool = self._pool_locked(scope)
+                nonce = self._claim_locked(pool)
+                if nonce is not None:
+                    return nonce
+                if duplicate_fetches >= 3:
+                    raise errors.NonceError(
+                        'Server repeatedly returned a nonce that was already used')
+                pending = pool.pending
+                if pending is None:
+                    pending = _NonceFetch()
+                    pool.pending = pending
+                    leader = True
+                else:
+                    leader = False
+
+            if leader:
+                try:
+                    fetched = _decode_nonce(fetch())
+                except BaseException as error:
+                    cancelled = isinstance(error, _CANCELLATION_ERRORS)
+                    with self._condition:
+                        if pool.pending is pending:
+                            pool.pending = None
+                        pending.done = True
+                        pending.cancelled = cancelled
+                        if not cancelled:
+                            pending.error = error
+                        self._condition.notify_all()
+                    raise
+                with self._condition:
+                    added = self._add_locked(pool, fetched)
+                    if pool.pending is pending:
+                        pool.pending = None
+                    pending.done = True
+                    self._condition.notify_all()
+                duplicate_fetches = 0 if added else duplicate_fetches + 1
+            else:
+                with self._condition:
+                    while not pending.done:
+                        self._condition.wait()
+                    if pending.error is not None:
+                        raise pending.error
+                    if pending.cancelled:
+                        continue
+
+    def available_count(self, scope: tuple[str, Optional[str]]) -> int:
+        """Return the number of currently usable nonces in a scope."""
+        with self._condition:
+            pool = self._pool_locked(scope)
+            self._prune_locked(pool, self._clock())
+            return len(pool.available)
 
 
 class ClientV2:
@@ -591,7 +810,8 @@ class ClientV2:
 class ClientNetwork:
     """Wrapper around requests that signs POSTs for authentication.
 
-    Also adds user agent, and handles Content-Type.
+    Also adds user agent, and handles Content-Type. Nonces are held in a
+    :class:`NonceManager`, which may be shared between ClientNetwork instances.
     """
     JSON_CONTENT_TYPE = 'application/json'
     JOSE_CONTENT_TYPE = 'application/jose+json'
@@ -608,16 +828,38 @@ class ClientNetwork:
     :param bool verify_ssl: Whether to verify certificates on SSL connections.
     :param str user_agent: String to send as User-Agent header.
     :param int timeout: Timeout for requests.
+    :param NonceManager nonce_manager: Nonce manager to use. If omitted, a
+        private manager is created for this ClientNetwork.
+    :param int nonce_pool_size: Maximum nonces kept per directory/account when
+        creating a private nonce manager.
+    :param float nonce_max_age: Maximum nonce age in seconds when creating a
+        private nonce manager.
+    :param bool allow_cross_account: Explicitly allow nonce sharing between
+        accounts using the same directory. This only applies when creating a
+        private nonce manager.
+    :param int max_bad_nonce_retries: Maximum number of badNonce re-signs.
     """
     def __init__(self, key: Optional[jose.JWK] = None,
                  account: Optional[messages.RegistrationResource] = None,
                  alg: jose.JWASignature = jose.RS256, verify_ssl: bool = True,
-                 user_agent: str = 'acme-python', timeout: int = DEFAULT_NETWORK_TIMEOUT) -> None:
+                 user_agent: str = 'acme-python', timeout: int = DEFAULT_NETWORK_TIMEOUT,
+                 nonce_manager: Optional[NonceManager] = None,
+                 nonce_pool_size: int = DEFAULT_NONCE_POOL_SIZE,
+                 nonce_max_age: float = DEFAULT_NONCE_MAX_AGE,
+                 allow_cross_account: bool = False,
+                 max_bad_nonce_retries: int = DEFAULT_BAD_NONCE_RETRIES) -> None:
+        if max_bad_nonce_retries < 0:
+            raise ValueError('max_bad_nonce_retries must not be negative')
         self.key = key
         self.account = account
         self.alg = alg
         self.verify_ssl = verify_ssl
-        self._nonces: set[str] = set()
+        self.nonce_manager = nonce_manager or NonceManager(
+            max_size=nonce_pool_size, max_age=nonce_max_age,
+            allow_cross_account=allow_cross_account)
+        self._nonce_manager = self.nonce_manager
+        self.max_bad_nonce_retries = max_bad_nonce_retries
+        self._jws_payload_context = threading.local()
         self.user_agent = user_agent
         self.session = requests.Session()
         self._default_timeout = timeout
@@ -634,7 +876,37 @@ class ClientNetwork:
         except Exception:  # pylint: disable=broad-except
             pass
 
-    def _wrap_in_jws(self, obj: jose.JSONDeSerializable, nonce: str, url: str) -> str:
+    def _serialize_payload(self, obj: Optional[jose.JSONDeSerializable]) -> bytes:
+        """Serialize a business object exactly once for a POST operation."""
+        if obj is None:
+            return b''
+        return obj.json_dumps(indent=2).encode()
+
+    def _sign_payload(self, payload: bytes, nonce: bytes, url: str,
+                      kid: Any = _UNSET, key: Any = _UNSET,
+                      alg: Any = _UNSET) -> str:
+        """Sign an already serialized payload in an ACME JWS."""
+        logger.debug('Signing JWS with a %d byte payload', len(payload))
+        signing_key = self.key if key is _UNSET else key
+        signing_alg = self.alg if alg is _UNSET else alg
+        assert signing_key
+        kwargs = {
+            "alg": signing_alg,
+            "nonce": nonce,
+            "url": url,
+            "key": signing_key
+        }
+        # newAccount and revokeCert work without the kid
+        # newAccount must not have kid
+        if kid is _UNSET:
+            kid = self._account_uri()
+        if kid is not None:
+            kwargs["kid"] = kid
+        return jws.JWS.sign(payload, **cast(Mapping[str, Any], kwargs)).json_dumps(indent=2)
+
+    def _wrap_in_jws(self, obj: Optional[jose.JSONDeSerializable],
+                     nonce: bytes, url: str, *,
+                     payload: Optional[bytes] = None) -> str:
         """Wrap `JSONDeSerializable` object in JWS.
 
         .. todo:: Implement ``acmePath``.
@@ -642,23 +914,20 @@ class ClientNetwork:
         :param josepy.JSONDeSerializable obj:
         :param str url: The URL to which this object will be POSTed
         :param str nonce:
+        :param bytes payload: Already serialized payload. If omitted, ``obj``
+            is serialized exactly once here.
         :rtype: str
 
         """
-        jobj = obj.json_dumps(indent=2).encode() if obj else b''
-        logger.debug('JWS payload:\n%s', jobj)
-        assert self.key
-        kwargs = {
-            "alg": self.alg,
-            "nonce": nonce,
-            "url": url,
-            "key": self.key
-        }
-        # newAccount and revokeCert work without the kid
-        # newAccount must not have kid
-        if self.account is not None:
-            kwargs["kid"] = self.account["uri"]
-        return jws.JWS.sign(jobj, **cast(Mapping[str, Any], kwargs)).json_dumps(indent=2)
+        if payload is None:
+            payload = getattr(self._jws_payload_context, 'value', None)
+        if payload is None:
+            payload = self._serialize_payload(obj)
+        kid = getattr(self._jws_payload_context, 'kid', _UNSET)
+        key = getattr(self._jws_payload_context, 'key', _UNSET)
+        alg = getattr(self._jws_payload_context, 'alg', _UNSET)
+        return self._sign_payload(
+            payload, nonce, url, kid=kid, key=key, alg=alg)
 
     @classmethod
     def _check_response(cls, response: requests.Response,
@@ -691,6 +960,10 @@ class ClientNetwork:
         except ValueError:
             jobj = None
 
+        if 300 <= response.status_code < 400:
+            raise errors.ClientError(
+                f'Unexpected redirect response (HTTP {response.status_code})')
+
         if response.status_code == 409:
             raise errors.ConflictError(response.headers.get('Location', 'UNKNOWN-LOCATION'))
 
@@ -701,10 +974,12 @@ class ClientNetwork:
                         'Ignoring wrong Content-Type (%r) for JSON Error',
                         response_ct)
                 try:
-                    raise messages.Error.from_json(jobj)
+                    error = messages.Error.from_json(jobj)
                 except jose.DeserializationError as error:
                     # Couldn't deserialize JSON object
                     raise errors.ClientError((response, error))
+                error.response = response
+                raise error
             else:
                 # response is not JSON object
                 raise errors.ClientError(response)
@@ -736,11 +1011,7 @@ class ClientNetwork:
 
 
         """
-        if method == "POST":
-            logger.debug('Sending POST request to %s:\n%s',
-                          url, kwargs['data'])
-        else:
-            logger.debug('Sending %s request to %s.', method, url)
+        logger.debug('Sending %s request to %s (request body omitted).', method, url)
         kwargs['verify'] = self.verify_ssl
         kwargs.setdefault('headers', {})
         kwargs['headers'].setdefault('User-Agent', self.user_agent)
@@ -751,7 +1022,10 @@ class ClientNetwork:
         # UTF-8 encoded. In this case, we don't set response.encoding and log
         # the base64 response instead of raw bytes to keep binary data out of the logs.
         debug_content: Union[bytes, str]
-        if "Accept" in kwargs["headers"]:
+        if method == "POST":
+            response.encoding = "utf-8"
+            debug_content = "<response body omitted>"
+        elif "Accept" in kwargs["headers"]:
             debug_content = base64.b64encode(response.content)
         else:
             # We set response.encoding so response.text knows the response is
@@ -760,10 +1034,22 @@ class ClientNetwork:
             # accesses of .text made on the returned response object as well.
             response.encoding = "utf-8"
             debug_content = response.text
+        raw_nonce = response.headers.get(self.REPLAY_NONCE_HEADER)
+        nonce_header = raw_nonce if isinstance(raw_nonce, str) and raw_nonce else None
+        if nonce_header and isinstance(debug_content, str):
+            debug_content = debug_content.replace(nonce_header, '<redacted>')
+        elif nonce_header:
+            encoded_nonce = nonce_header.encode('ascii')
+            debug_content = debug_content.replace(encoded_nonce, b'<redacted>')
+        safe_headers = "\n".join(
+            "{0}: {1}".format(
+                k, '<redacted>' if 'nonce' in k.lower()
+                else (str(v).replace(nonce_header, '<redacted>')
+                      if nonce_header else v))
+            for k, v in response.headers.items())
         logger.debug('Received response:\nHTTP %d\n%s\n\n%s',
                      response.status_code,
-                     "\n".join("{0}: {1}".format(k, v)
-                                for k, v in response.headers.items()),
+                     safe_headers,
                      debug_content)
         return response
 
@@ -783,54 +1069,231 @@ class ClientNetwork:
         return self._check_response(
             self._send_request('GET', url, **kwargs), content_type=content_type)
 
-    def _add_nonce(self, response: requests.Response) -> None:
-        if self.REPLAY_NONCE_HEADER in response.headers:
-            nonce = response.headers[self.REPLAY_NONCE_HEADER]
+    def _account_uri(self) -> Optional[str]:
+        """Return the current account URI, if one is configured."""
+        if self.account is not None:
             try:
-                decoded_nonce = jws.Header._fields['nonce'].decode(nonce)
-            except jose.DeserializationError as error:
-                raise errors.BadNonce(nonce, error)
-            logger.debug('Storing nonce: %s', nonce)
-            self._nonces.add(decoded_nonce)
-        else:
-            raise errors.MissingNonce(response)
+                return self.account["uri"]
+            except (KeyError, TypeError, AttributeError):
+                return None
+        return None
 
-    def _get_nonce(self, url: str, new_nonce_url: str) -> str:
-        if not self._nonces:
-            logger.debug('Requesting fresh nonce')
+    def _account_snapshot(self) -> tuple[Optional[str], str]:
+        """Snapshot the account URI and non-secret scope identity."""
+        account = self.account
+        if account is not None:
+            try:
+                account_uri = account["uri"]
+            except (KeyError, TypeError, AttributeError):
+                account_uri = None
+            if account_uri is not None:
+                return account_uri, f'account:{account_uri}'
+            return None, f'account-object:{id(account)}'
+        key = self.key
+        if key is not None:
+            try:
+                return None, 'key:' + jose.b64encode(key.thumbprint()).decode('ascii')
+            except Exception:  # pylint: disable=broad-except
+                return None, f'key-object:{id(key)}'
+        return None, 'anonymous'
+
+    def _account_identity(self) -> str:
+        """Return a non-secret identity for the current account configuration."""
+        return self._account_snapshot()[1]
+
+    def _nonce_scope(self, request_url: str, new_nonce_url: Optional[str],
+                     account_identity: Any = _UNSET
+                     ) -> tuple[str, Optional[str]]:
+        if new_nonce_url is not None:
+            directory_url = new_nonce_url
+        else:
+            parts = urlsplit(request_url)
+            directory_url = (
+                urlunsplit((parts.scheme, parts.netloc, '/', '', ''))
+                if parts.scheme or parts.netloc else request_url)
+        if account_identity is _UNSET:
+            account_identity = self._account_identity()
+        return self.nonce_manager.scope_for(
+            directory_url, account_identity)
+
+    @staticmethod
+    def _is_direct_response(response: requests.Response,
+                            expected_url: Optional[str]) -> bool:
+        status = getattr(response, 'status_code', None)
+        if isinstance(status, int) and 300 <= status < 400:
+            return False
+        history = getattr(response, 'history', None)
+        if isinstance(history, (list, tuple)) and history:
+            return False
+        response_url = getattr(response, 'url', None)
+        if (expected_url is not None and isinstance(response_url, str)
+                and response_url
+                and _canonical_url(response_url) != _canonical_url(expected_url)):
+            return False
+        return True
+
+    @classmethod
+    def _response_nonce(cls, response: requests.Response) -> str:
+        nonce = response.headers.get(cls.REPLAY_NONCE_HEADER)
+        if nonce is None:
+            raise errors.MissingNonce(response)
+        try:
+            _decode_nonce(nonce)
+        except jose.DeserializationError as error:
+            raise errors.BadNonce(nonce, error)
+        return nonce
+
+    def _add_nonce(self, response: requests.Response,
+                   scope: tuple[str, Optional[str]],
+                   expected_url: Optional[str] = None) -> None:
+        if not self._is_direct_response(response, expected_url):
+            raise errors.ClientError('Refusing nonce from a redirected response')
+        nonce = self._response_nonce(response)
+        self.nonce_manager.add_nonce(scope, nonce)
+        logger.debug('Stored a replay nonce for the configured directory scope')
+
+    def _retry_nonce(self, response: Optional[requests.Response],
+                     url: str, scope: tuple[str, Optional[str]]) -> Optional[bytes]:
+        if response is None or not self._is_direct_response(response, url):
+            return None
+        nonce = response.headers.get(self.REPLAY_NONCE_HEADER)
+        if nonce is None:
+            return None
+        try:
+            _decode_nonce(nonce)
+        except jose.DeserializationError:
+            logger.debug('Ignoring invalid nonce in badNonce response')
+            return None
+        self.nonce_manager.mark_used(scope, nonce)
+        return _decode_nonce(nonce)
+
+    def _get_nonce(self, url: str, new_nonce_url: Optional[str],
+                   scope: Optional[tuple[str, Optional[str]]] = None) -> bytes:
+        if scope is None:
+            scope = self._nonce_scope(url, new_nonce_url)
+
+        def fetch_nonce() -> bytes:
+            logger.debug('Requesting a fresh nonce for the configured directory scope')
             if new_nonce_url is None:
                 response = self.head(url)
+                if (not response.ok
+                        and response.status_code != http_client.METHOD_NOT_ALLOWED):
+                    raise errors.ClientError(
+                        'Refusing nonce from an unsuccessful response')
             else:
-                # request a new nonce from the acme newNonce endpoint
-                response = self._check_response(self.head(new_nonce_url), content_type=None)
-            self._add_nonce(response)
-        return self._nonces.pop()
+                response = self._check_response(
+                    self.head(new_nonce_url, allow_redirects=False),
+                    content_type=None)
+            if not self._is_direct_response(response, new_nonce_url or url):
+                raise errors.ClientError('Refusing nonce from a redirected response')
+            return self._response_nonce(response)
 
-    def post(self, *args: Any, **kwargs: Any) -> requests.Response:
-        """POST object wrapped in `.JWS` and check response.
+        return self.nonce_manager.get_nonce(scope, fetch_nonce)
 
-        If the server responded with a badNonce error, the request will
-        be retried once.
+    def post(self, url: str, obj: Optional[jose.JSONDeSerializable],
+             content_type: str = JOSE_CONTENT_TYPE, **kwargs: Any) -> requests.Response:
+        """POST an object wrapped in `.JWS` and check the response.
 
+        The payload is serialized once before the first request. A badNonce
+        response may cause a bounded re-sign using the nonce supplied by that
+        response; the payload is never re-serialized and connection errors are
+        never retried.
         """
-        try:
-            return self._post_once(*args, **kwargs)
-        except messages.Error as error:
-            if error.code == 'badNonce':
-                logger.debug('Retrying request after error:\n%s', error)
-                return self._post_once(*args, **kwargs)
-            raise
-
-    def _post_once(self, url: str, obj: jose.JSONDeSerializable,
-                   content_type: str = JOSE_CONTENT_TYPE, **kwargs: Any) -> requests.Response:
         new_nonce_url = kwargs.pop('new_nonce_url', None)
-        if not self.key:
+        key = self.key
+        alg = self.alg
+        if not key:
             raise errors.Error("acme.ClientNetwork with no private key can't POST.")
-        data = self._wrap_in_jws(obj, self._get_nonce(url, new_nonce_url), url)
-        kwargs.setdefault('headers', {'Content-Type': content_type})
+
+        kid, account_identity = self._account_snapshot()
+        scope = self._nonce_scope(url, new_nonce_url, account_identity)
+        payload = self._serialize_payload(obj)
+        retry_nonce: Optional[bytes] = None
+
+        for attempt in range(self.max_bad_nonce_retries + 1):
+            nonce = retry_nonce
+            retry_nonce = None
+            if nonce is None:
+                nonce = self._get_nonce(url, new_nonce_url, scope)
+
+            try:
+                return self._post_once(
+                    url, obj, content_type, _payload=payload, _nonce=nonce,
+                    _scope=scope, _kid=kid, _key=key, _alg=alg,
+                    new_nonce_url=new_nonce_url, **kwargs)
+            except messages.Error as error:
+                if error.code != 'badNonce' or attempt >= self.max_bad_nonce_retries:
+                    raise
+                error_response = getattr(error, 'response', None)
+                if (error_response is not None
+                        and not self._is_direct_response(error_response, url)):
+                    raise
+                retry_nonce = self._retry_nonce(error_response, url, scope)
+                logger.debug('Retrying after badNonce (retry %d of %d)',
+                             attempt + 1, self.max_bad_nonce_retries)
+
+        raise AssertionError('unreachable')  # pragma: no cover
+
+    def _post_once(self, url: str, obj: Optional[jose.JSONDeSerializable],
+                   content_type: str = JOSE_CONTENT_TYPE, **kwargs: Any
+                   ) -> requests.Response:
+        new_nonce_url = kwargs.pop('new_nonce_url', None)
+        payload = kwargs.pop('_payload', None)
+        nonce = kwargs.pop('_nonce', None)
+        scope = kwargs.pop('_scope', None)
+        kid = kwargs.pop('_kid', _UNSET)
+        key = kwargs.pop('_key', _UNSET)
+        alg = kwargs.pop('_alg', _UNSET)
+        if key is _UNSET:
+            key = self.key
+        if alg is _UNSET:
+            alg = self.alg
+        if not key:
+            raise errors.Error("acme.ClientNetwork with no private key can't POST.")
+        if payload is None:
+            payload = self._serialize_payload(obj)
+        if nonce is None:
+            nonce = self._get_nonce(url, new_nonce_url, scope)
+        if scope is None:
+            scope = self._nonce_scope(url, new_nonce_url)
+        if kid is _UNSET:
+            kid = self._account_snapshot()[0]
+
+        previous_payload = getattr(self._jws_payload_context, 'value', None)
+        previous_kid = getattr(self._jws_payload_context, 'kid', _UNSET)
+        previous_key = getattr(self._jws_payload_context, 'key', _UNSET)
+        previous_alg = getattr(self._jws_payload_context, 'alg', _UNSET)
+        self._jws_payload_context.value = payload
+        self._jws_payload_context.kid = kid
+        self._jws_payload_context.key = key
+        self._jws_payload_context.alg = alg
+        try:
+            data = self._wrap_in_jws(obj, nonce, url)
+        finally:
+            if previous_payload is None:
+                del self._jws_payload_context.value
+            else:
+                self._jws_payload_context.value = previous_payload
+            if previous_kid is _UNSET:
+                del self._jws_payload_context.kid
+            else:
+                self._jws_payload_context.kid = previous_kid
+            if previous_key is _UNSET:
+                del self._jws_payload_context.key
+            else:
+                self._jws_payload_context.key = previous_key
+            if previous_alg is _UNSET:
+                del self._jws_payload_context.alg
+            else:
+                self._jws_payload_context.alg = previous_alg
+        headers = dict(kwargs.pop('headers', {}) or {})
+        if content_type is not None:
+            headers.setdefault('Content-Type', content_type)
+        kwargs['headers'] = headers
+        kwargs['allow_redirects'] = False
         response = self._send_request('POST', url, data=data, **kwargs)
         response = self._check_response(response, content_type=content_type)
-        self._add_nonce(response)
+        self._add_nonce(response, scope, expected_url=url)
         return response
 
 def _renewal_info_path_component(cert: x509.Certificate) -> str:

@@ -14,7 +14,8 @@ class BadNonceTest(unittest.TestCase):
         self.error = BadNonce(nonce="xxx", error="error")
 
     def test_str(self):
-        assert "Invalid nonce ('xxx'): error" == str(self.error)
+        assert 'Invalid replay nonce' in str(self.error)
+        assert 'xxx' not in str(self.error)
 
 
 class MissingNonceTest(unittest.TestCase):
@@ -22,13 +23,14 @@ class MissingNonceTest(unittest.TestCase):
 
     def setUp(self):
         from acme.errors import MissingNonce
-        self.response = mock.MagicMock(headers={})
+        self.response = mock.MagicMock(
+            headers={'Replay-Nonce': 'secret-header'})
         self.response.request.method = 'FOO'
         self.error = MissingNonce(self.response)
 
     def test_str(self):
         assert "FOO" in str(self.error)
-        assert "{}" in str(self.error)
+        assert "secret-header" not in str(self.error)
 
 
 class PollErrorTest(unittest.TestCase):
