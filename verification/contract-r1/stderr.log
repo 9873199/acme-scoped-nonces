@@ -1,0 +1,30 @@
+test_badnonce_duplicate_cannot_be_claimed_by_two_requests (__main__.Contract.test_badnonce_duplicate_cannot_be_claimed_by_two_requests) ... FAIL
+test_base64url_padding_is_rejected (__main__.Contract.test_base64url_padding_is_rejected) ... FAIL
+test_pool_capacity_expiry_and_atomic_claim (__main__.Contract.test_pool_capacity_expiry_and_atomic_claim) ... ok
+test_post_as_get_has_empty_payload (__main__.Contract.test_post_as_get_has_empty_payload) ... ok
+test_scopes_do_not_mix_same_nonce_bytes (__main__.Contract.test_scopes_do_not_mix_same_nonce_bytes) ... ok
+test_single_badnonce_preserves_one_serialization (__main__.Contract.test_single_badnonce_preserves_one_serialization) ... ok
+test_transport_error_is_not_retried (__main__.Contract.test_transport_error_is_not_retried) ... ok
+
+======================================================================
+FAIL: test_badnonce_duplicate_cannot_be_claimed_by_two_requests (__main__.Contract.test_badnonce_duplicate_cannot_be_claimed_by_two_requests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\hc\userFeedback\cache\execution-security30-20261125-r1\evaluation\uid12435-today-r1\contract_checks.py", line 85, in test_badnonce_duplicate_cannot_be_claimed_by_two_requests
+    self.assertLessEqual(len(used),1,'same error-response nonce was signed into two requests')
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 2 not less than or equal to 1 : same error-response nonce was signed into two requests
+
+======================================================================
+FAIL: test_base64url_padding_is_rejected (__main__.Contract.test_base64url_padding_is_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\hc\userFeedback\cache\execution-security30-20261125-r1\evaluation\uid12435-today-r1\contract_checks.py", line 88, in test_base64url_padding_is_rejected
+    with self.assertRaises(Exception):m.add_nonce(s,'UQ==')
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+AssertionError: Exception not raised
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.035s
+
+FAILED (failures=2)

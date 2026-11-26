@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\runtime-tasks\\acme-nonce\\env\\Scripts\\python.exe",
+    "-B",
+    "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1\\contract_checks.py"
+  ],
+  "cwd": "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1",
+  "exit_code": 1,
+  "seconds": 2.2909226417541504
+}

@@ -1,0 +1,192 @@
+{
+  "uid": 12435,
+  "reviewer": "Codex AI-assisted",
+  "score": 3,
+  "feedback": "正常的目录隔离和单次重签能跑通，但并发错误重试还有漏口。两个请求同时收到带相同nonce的badNonce响应时，_retry_nonce会直接把这个值交给各自重签，绕过池的原子领取，最后两份真实JWS用了同一个nonce。新增client_nonce_test.py分别测了池的并发领取和单次badNonce，却没把这两条路径合起来测。另外，nonce解码还接受了带等号填充的值，没有按规范限制输入。",
+  "native_sha256": "6acf306ee72f388ecdd7a7bbea418a59404690ebee19fe1582d50899ad95066a",
+  "regression_result": {
+    "time": "2026-11-27T03:16:08+08:00",
+    "uid": 12435,
+    "argv": [
+      "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\runtime-tasks\\acme-nonce\\env\\Scripts\\python.exe",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "acme/src/acme/_internal/tests/client_nonce_test.py",
+      "acme/src/acme/_internal/tests/client_test.py",
+      "acme/src/acme/_internal/tests/errors_test.py",
+      "-o",
+      "addopts=",
+      "-o",
+      "cache_dir=D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1\\regression-r1\\tmp\\pytest-cache",
+      "--basetemp",
+      "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1\\regression-r1\\tmp\\pytest",
+      "--disable-socket",
+      "--allow-hosts=127.0.0.1,::1"
+    ],
+    "cwd": "D:\\hc\\userFeedback\\cache\\compact-replays\\uid12435-today-r1",
+    "exit_code": 0,
+    "seconds": 5.2864625453948975,
+    "source_manifest_sha256": "6759cfe00cd8a55289d2f4fb3c9a6386c025a1be04ac2eb482aef942777debee",
+    "stdout_sha256": "73aee08936efa04148e5378f31c9933274a7441bb67c7cac9291b1573cfcf579",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "no_live_database_or_remote_audit": true
+  },
+  "independent_result": {
+    "argv": [
+      "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\runtime-tasks\\acme-nonce\\env\\Scripts\\python.exe",
+      "-B",
+      "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1\\contract_checks.py"
+    ],
+    "cwd": "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1",
+    "exit_code": 1,
+    "seconds": 2.2909226417541504
+  },
+  "observable_actions": [
+    {
+      "native_line": 21,
+      "command": "rg -n \"class ClientNetwork|ClientNetwork|Replay-Nonce|badNonce|bad_nonce|nonce\" acme/src acme/tests certbot/src | Select-Object -First 300"
+    },
+    {
+      "native_line": 23,
+      "command": "Get-Content acme\\pyproject.toml; Get-Content pytest.ini -TotalCount 160"
+    },
+    {
+      "native_line": 53,
+      "command": "$u='https://raw.githubusercontent.com/certbot/certbot/main/acme/src/acme/client.py'; try { (Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 20).Content | Select-String -Pattern 'class .*Nonce|nonce' -Context 2,5 | Select-Object -First 80 } catch { $_.Exception.Message }"
+    },
+    {
+      "native_line": 54,
+      "command": "rg -n \"Replay-Nonce|nonce manager|NonceManager|_nonces\" . --glob '!**/.git/**' --glob '!**/*.min.js' | Select-Object -First 200"
+    },
+    {
+      "native_line": 71,
+      "command": "rg -n \"_wrap_in_jws|_post_once|_get_nonce|_add_nonce|_nonces|post\\(\" acme\\src\\acme\\_internal\\tests\\client_test.py certbot\\src\\certbot\\_internal\\tests | Select-Object -First 200"
+    },
+    {
+      "native_line": 81,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_test.py -q"
+    },
+    {
+      "native_line": 134,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 149,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 171,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_test.py -q"
+    },
+    {
+      "native_line": 182,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_test.py -q"
+    },
+    {
+      "native_line": 204,
+      "command": "python -c \"import josepy as jose; from acme import jws; from acme._internal.tests import test_util; k=jose.JWKRSA.load(test_util.load_vector('rsa512_key.pem')); x=jws.JWS.sign(b'{}', key=k, alg=jose.RS256, nonce=b'abc', url='https://a', kid=None); d=x.json_dumps(); y=jws.JWS.json_loads(d); print(y.verify(k.public_key()), y.payload, y.signature.combined.nonce, y.signature.combined.url)\""
+    },
+    {
+      "native_line": 229,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py -q"
+    },
+    {
+      "native_line": 230,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 238,
+      "command": "python -m pytest acme/src/acme/_internal/tests -q"
+    },
+    {
+      "native_line": 248,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 249,
+      "command": "rg -n \".{101}\" acme\\src\\acme\\client.py acme\\src\\acme\\errors.py acme\\src\\acme\\_internal\\tests\\client_nonce_test.py"
+    },
+    {
+      "native_line": 273,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 309,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 310,
+      "command": "python -m pytest acme/src/acme/_internal/tests -q --ignore=acme/src/acme/_internal/tests/standalone_test.py"
+    },
+    {
+      "native_line": 322,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 323,
+      "command": "python -m pytest acme/src/acme/_internal/tests -q --ignore=acme/src/acme/_internal/tests/standalone_test.py"
+    },
+    {
+      "native_line": 331,
+      "command": "python -m pytest certbot/src/certbot/_internal/tests/client_test.py certbot/src/certbot/_internal/tests/renewal_test.py -q"
+    },
+    {
+      "native_line": 350,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 351,
+      "command": "python -m pytest acme/src/acme/_internal/tests -q --ignore=acme/src/acme/_internal/tests/standalone_test.py"
+    },
+    {
+      "native_line": 375,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 376,
+      "command": "python -m pytest acme/src/acme/_internal/tests -q --ignore=acme/src/acme/_internal/tests/standalone_test.py"
+    },
+    {
+      "native_line": 382,
+      "command": "git diff --check; python -m compileall -q acme/src/acme; rg -n \".{101}\" acme\\src\\acme\\client.py acme\\src\\acme\\errors.py acme\\src\\acme\\_internal\\tests\\client_nonce_test.py"
+    },
+    {
+      "native_line": 384,
+      "command": "Get-Content acme\\src\\acme\\_internal\\tests\\client_nonce_test.py -TotalCount 80"
+    },
+    {
+      "native_line": 421,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py -q"
+    },
+    {
+      "native_line": 428,
+      "command": "python -m pytest acme/src/acme/_internal/tests -q --ignore=acme/src/acme/_internal/tests/standalone_test.py"
+    },
+    {
+      "native_line": 430,
+      "command": "python -m pytest acme/src/acme/_internal/tests/client_nonce_test.py acme/src/acme/_internal/tests/client_test.py acme/src/acme/_internal/tests/errors_test.py -q"
+    },
+    {
+      "native_line": 442,
+      "command": "rg -n \"class NonceManager|def get_nonce|def post\\(|def _post_once|def _nonce_scope|def _send_request|class BadNonce|class MissingNonce\" acme\\src\\acme\\client.py acme\\src\\acme\\errors.py"
+    },
+    {
+      "native_line": 443,
+      "command": "rg -n \"def test_nonces_are_isolated|def test_same_nonce|def test_account_scope|def test_serialization|def test_capacity|def test_cancelled|def test_bad_nonce_uses|def test_consecutive|def test_post_as_get|def test_connection|def test_redirected|def test_error_page|def test_logs\" acme\\src\\acme\\_internal\\tests\\client_nonce_test.py"
+    }
+  ],
+  "facts": [
+    {
+      "function": "ClientNetwork._retry_nonce",
+      "observation": "Two concurrent badNonce replies with equal Replay-Nonce cause two separate JWS signatures using that nonce; cryptographic verification succeeded for both."
+    },
+    {
+      "function": "_decode_nonce",
+      "observation": "Padded base64url value accepted; RFC8555 section 6.5.1 nonce grammar excludes equals padding."
+    }
+  ],
+  "no_live_network": true,
+  "frozen_commit": "31f46661f5ce86de7186ebbfea4c64b1b1e424ca"
+}

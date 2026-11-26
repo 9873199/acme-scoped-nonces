@@ -1,0 +1,24 @@
+{
+  "time": "2026-11-27T03:16:03+08:00",
+  "pid": 27144,
+  "controller_pid": 37740,
+  "argv": [
+    "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\runtime-tasks\\acme-nonce\\env\\Scripts\\python.exe",
+    "-B",
+    "-m",
+    "pytest",
+    "-q",
+    "acme/src/acme/_internal/tests/client_nonce_test.py",
+    "acme/src/acme/_internal/tests/client_test.py",
+    "acme/src/acme/_internal/tests/errors_test.py",
+    "-o",
+    "addopts=",
+    "-o",
+    "cache_dir=D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1\\regression-r1\\tmp\\pytest-cache",
+    "--basetemp",
+    "D:\\hc\\userFeedback\\cache\\execution-security30-20261125-r1\\evaluation\\uid12435-today-r1\\regression-r1\\tmp\\pytest",
+    "--disable-socket",
+    "--allow-hosts=127.0.0.1,::1"
+  ],
+  "cwd": "D:\\hc\\userFeedback\\cache\\compact-replays\\uid12435-today-r1"
+}
